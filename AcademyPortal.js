@@ -213,6 +213,387 @@ function GetMaxMissionRate() {
   SavePlayerData()
 }
 
+function GetProjectPlanNeeds() {
+  const total = [0, 0, 0, 0, 0, 0, 0, 0]
+  let hasGoals = false
+
+  for (let i = 0; i < GameDB.academy.projects.length; i++) {
+    const goal = playerData.academy.projectGoals[i] || 0
+    if (goal <= 0) continue
+
+    hasGoals = true
+
+    const startLevel = playerData.academy.projectLevels[i]
+    const costDiv = new ProjectConfig(i, startLevel).getCostDiv()
+
+    for (let level = startLevel; level < startLevel + goal; level++) {
+      const costs = GameDB.academy.projectNextLevelCost(
+        i,
+        level,
+        costDiv,
+        playerData.ouro.enabled,
+      )
+
+      for (let m = 0; m < 8; m++) {
+        total[m] += costs[m]
+      }
+    }
+  }
+
+  const needed = total.map((amount, m) =>
+    Math.max(0, amount - (playerData.academy.stock[m] || 0)),
+  )
+
+  return { hasGoals, needed }
+}
+
+function GetFarmMatRates() {
+  const missionSpeedBonus = GetMissionSpeedBonus()
+  const matBonus = GetCurrentMatBonus()
+  const rates = []
+
+  for (let i = 0; i < GameDB.academy.farms.length; i++) {
+    const farmInfo = GameDB.academy.farms[i]
+    const farmSetting = playerData.academy.farms[Math.floor(i / 3)][i % 3]
+
+    let power = 0
+    power += (farmSetting.pods || 0) * playerData.academy.personnel[0].power
+    power +=
+      (farmSetting.fireteams || 0) * playerData.academy.personnel[1].power
+    power += (farmSetting.titans || 0) * playerData.academy.personnel[2].power
+    power +=
+      (farmSetting.corvettes || 0) * playerData.academy.personnel[3].power
+
+    const farmRate = [0, 0, 0, 0, 0, 0, 0, 0]
+
+    if (power > 0) {
+      const cycle = Math.max(
+        2,
+        (60 * farmInfo.baseTime) / (power * missionSpeedBonus),
+      )
+
+      for (let m = 0; m < 8; m++) {
+        farmRate[m] = (farmInfo.baseMats[m] * matBonus) / cycle
+      }
+    }
+
+    rates.push(farmRate)
+  }
+
+  return rates
+}
+
+function EstimateProjectCompletionTime() {
+  const planNeeds = GetProjectPlanNeeds()
+  if (!planNeeds.hasGoals) return { status: 'no-goals' }
+
+  let affordable = true
+  for (let m = 0; m < 8; m++) {
+    if (planNeeds.needed[m] > 0) affordable = false
+  }
+  if (affordable) return { status: 'affordable' }
+
+  const farmRates = GetFarmMatRates()
+  const totalRates = [0, 0, 0, 0, 0, 0, 0, 0]
+
+  for (let i = 0; i < farmRates.length; i++) {
+    for (let m = 0; m < 8; m++) {
+      totalRates[m] += farmRates[i][m]
+    }
+  }
+
+  let time = 0
+  let bottleneck = -1
+
+  for (let m = 0; m < 8; m++) {
+    if (planNeeds.needed[m] <= 0) continue
+
+    const matTime =
+      totalRates[m] === 0 ? Infinity : planNeeds.needed[m] / totalRates[m]
+
+    if (matTime > time) {
+      time = matTime
+      bottleneck = m
+    }
+  }
+
+  return {
+    status: time === Infinity ? 'never' : 'eta',
+    time,
+    bottleneck,
+  }
+}
+
+function GetMaxProjectRate() {
+  const planNeeds = GetProjectPlanNeeds()
+  if (!planNeeds.hasGoals) return { status: 'no-goals' }
+
+  let affordable = true
+  for (let m = 0; m < 8; m++) {
+    if (planNeeds.needed[m] > 0) affordable = false
+  }
+  if (affordable) return { status: 'affordable' }
+
+  const needed = planNeeds.needed
+  const neededMats = []
+  for (let m = 0; m < 8; m++) {
+    if (needed[m] > 0) neededMats.push(m)
+  }
+  const neededCount = neededMats.length
+
+  const missionSpeedBonus = GetMissionSpeedBonus()
+  // Zeus-rank growth during the farming period is a second-order effect and is
+  // intentionally ignored: it multiplies all farms' yields uniformly, so it
+  // cannot change which farm a head is best placed on
+  const matBonus = GetStaticMatBonus() * GetDynamicMatBonus()
+
+  const unitPowers = [
+    playerData.academy.personnel[0].power,
+    playerData.academy.personnel[1].power,
+    playerData.academy.personnel[2].power,
+    playerData.academy.personnel[3].power,
+  ]
+
+  const available = [
+    playerData.academy.personnel[0].population,
+    playerData.academy.personnel[1].population,
+    playerData.academy.personnel[2].population,
+    playerData.academy.personnel[3].population,
+  ]
+
+  const farms = []
+
+  for (let planet = 0; planet < GameDB.academy.planets; planet++) {
+    for (let farm = 0; farm < 3; farm++) {
+      const farmInfo = GameDB.academy.farms[planet * 3 + farm]
+      const farmSetting = playerData.academy.farms[planet][farm]
+
+      const state = {
+        planet,
+        farm,
+        locked: !!farmSetting.locked,
+        maxPop: farmInfo.maxPop,
+        heads: [0, 0, 0, 0],
+        totalHeads: 0,
+        power: 0,
+        rate: [0, 0, 0, 0, 0, 0, 0, 0],
+        // rate[m] = min(rateCap[m], rateSlope[m] * power) is the shared
+        // cycle formula cycle = max(2, cycleBase / power) folded per material
+        cycleBase: (60 * farmInfo.baseTime) / missionSpeedBonus,
+        rateSlope: [0, 0, 0, 0, 0, 0, 0, 0],
+        rateCap: [0, 0, 0, 0, 0, 0, 0, 0],
+      }
+
+      for (let m = 0; m < 8; m++) {
+        const perRun = farmInfo.baseMats[m] * matBonus
+        state.rateSlope[m] = perRun / state.cycleBase
+        state.rateCap[m] = perRun / 2
+      }
+
+      if (state.locked) {
+        state.heads = [
+          farmSetting.pods || 0,
+          farmSetting.fireteams || 0,
+          farmSetting.titans || 0,
+          farmSetting.corvettes || 0,
+        ]
+
+        for (let t = 0; t < 4; t++) {
+          state.totalHeads += state.heads[t]
+          state.power += state.heads[t] * unitPowers[t]
+          available[t] -= state.heads[t]
+        }
+      } else {
+        farmSetting.pods = 0
+        farmSetting.fireteams = 0
+        farmSetting.titans = 0
+        farmSetting.corvettes = 0
+      }
+
+      for (let m = 0; m < 8; m++) {
+        state.rate[m] = Math.min(
+          state.rateCap[m],
+          state.rateSlope[m] * state.power,
+        )
+      }
+
+      farms.push(state)
+    }
+  }
+
+  const totalRate = [0, 0, 0, 0, 0, 0, 0, 0]
+  for (let i = 0; i < farms.length; i++) {
+    for (let m = 0; m < 8; m++) {
+      totalRate[m] += farms[i].rate[m]
+    }
+  }
+
+  const computeT = () => {
+    let t = 0
+    for (let mi = 0; mi < neededCount; mi++) {
+      const m = neededMats[mi]
+      t = Math.max(t, totalRate[m] === 0 ? Infinity : needed[m] / totalRate[m])
+    }
+    return t
+  }
+
+  const computeS = () => {
+    let s = 0
+    for (let mi = 0; mi < neededCount; mi++) {
+      const m = neededMats[mi]
+      s += totalRate[m] === 0 ? Infinity : needed[m] / totalRate[m]
+    }
+    return s
+  }
+
+  // While any needed material has no rate at all, T and S are Infinity for
+  // every candidate, so the count of uncovered materials acts as the primary
+  // comparison key; once every needed material has a rate this reduces to the
+  // plain T / S comparison below
+  const computeZeros = () => {
+    let zeros = 0
+    for (let mi = 0; mi < neededCount; mi++) {
+      if (totalRate[neededMats[mi]] === 0) zeros++
+    }
+    return zeros
+  }
+
+  let currentT = computeT()
+  let currentS = computeS()
+  let currentZeros = computeZeros()
+
+  // Greedy per-head allocation. Surplus heads that cannot reduce the
+  // completion time any further are intentionally left unassigned.
+  while (
+    available[0] > 0 ||
+    available[1] > 0 ||
+    available[2] > 0 ||
+    available[3] > 0
+  ) {
+    let bestFarm = null
+    let bestType = -1
+    let bestT = currentT
+    let bestS = currentS
+    let bestZeros = currentZeros
+
+    for (let fi = 0; fi < farms.length; fi++) {
+      const f = farms[fi]
+      if (f.locked) continue
+      if (f.totalHeads >= f.maxPop) continue
+      if (f.power > 0 && f.cycleBase / f.power <= 2) continue
+
+      for (let t = 0; t < 4; t++) {
+        if (available[t] <= 0) continue
+
+        const newPower = f.power + unitPowers[t]
+        let candT = 0
+        let candZeros = 0
+
+        for (let mi = 0; mi < neededCount; mi++) {
+          const m = neededMats[mi]
+          const farmRate = Math.min(f.rateCap[m], f.rateSlope[m] * newPower)
+          const matRate = totalRate[m] - f.rate[m] + farmRate
+          if (matRate === 0) {
+            candZeros++
+            candT = Infinity
+            continue
+          }
+
+          const matTime = needed[m] / matRate
+          if (matTime > candT) candT = matTime
+        }
+
+        if (
+          candZeros < bestZeros ||
+          (candZeros === bestZeros && candT < bestT)
+        ) {
+          bestZeros = candZeros
+          bestT = candT
+          bestFarm = f
+          bestType = t
+        }
+      }
+    }
+
+    if (!bestFarm) {
+      // secondary objective: sum of per-material times, breaks exact
+      // bottleneck ties the max objective cannot distinguish
+      for (let fi = 0; fi < farms.length; fi++) {
+        const f = farms[fi]
+        if (f.locked) continue
+        if (f.totalHeads >= f.maxPop) continue
+        if (f.power > 0 && f.cycleBase / f.power <= 2) continue
+
+        for (let t = 0; t < 4; t++) {
+          if (available[t] <= 0) continue
+
+          const newPower = f.power + unitPowers[t]
+          let candS = 0
+          let candZeros = 0
+
+          for (let mi = 0; mi < neededCount; mi++) {
+            const m = neededMats[mi]
+            const farmRate = Math.min(f.rateCap[m], f.rateSlope[m] * newPower)
+            const matRate = totalRate[m] - f.rate[m] + farmRate
+            if (matRate === 0) {
+              candZeros++
+              candS = Infinity
+              continue
+            }
+
+            candS += needed[m] / matRate
+          }
+
+          if (
+            candZeros < bestZeros ||
+            (candZeros === bestZeros && candS < bestS)
+          ) {
+            bestZeros = candZeros
+            bestS = candS
+            bestFarm = f
+            bestType = t
+          }
+        }
+      }
+    }
+
+    if (!bestFarm) break
+
+    bestFarm.heads[bestType]++
+    bestFarm.totalHeads++
+    available[bestType]--
+    bestFarm.power += unitPowers[bestType]
+
+    for (let m = 0; m < 8; m++) {
+      const newRate = Math.min(
+        bestFarm.rateCap[m],
+        bestFarm.rateSlope[m] * bestFarm.power,
+      )
+      totalRate[m] += newRate - bestFarm.rate[m]
+      bestFarm.rate[m] = newRate
+    }
+
+    currentT = computeT()
+    currentS = computeS()
+    currentZeros = computeZeros()
+  }
+
+  for (let i = 0; i < farms.length; i++) {
+    const state = farms[i]
+    if (state.locked) continue
+
+    const farmSetting = playerData.academy.farms[state.planet][state.farm]
+    farmSetting.pods = state.heads[0]
+    farmSetting.fireteams = state.heads[1]
+    farmSetting.titans = state.heads[2]
+    farmSetting.corvettes = state.heads[3]
+  }
+
+  SavePlayerData()
+
+  return { status: 'ok', time: currentT }
+}
+
 const getMatBonusFromLoopMod = () => {
   return (
     Math.pow(1.01, playerData.loopMods.beyonders) *

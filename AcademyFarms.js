@@ -397,6 +397,24 @@ academyFarmPortal.pages.default.initFunction = function (panel) {
     assignButton.addEventListener('click', maximizeMissionRate)
     section.append(assignButton)
 
+    const projectRateButton = createElement(
+      'button',
+      'btn btn-secondary',
+      {
+        type: 'button',
+        style: 'display: block; margin: 20px auto; min-width: 300px',
+      },
+      'Maximize Project Rate',
+    )
+    projectRateButton.addEventListener('click', maximizeProjectRate)
+    section.append(projectRateButton)
+
+    portalPanel.projectRateInfo = createElement('div', 'font-normal', {
+      style: 'text-align: center; margin-top: 10px',
+    })
+    updateProjectRateInfo()
+    section.append(portalPanel.projectRateInfo)
+
     const clearButton = createElement(
       'button',
       'btn btn-secondary',
@@ -728,6 +746,47 @@ function maximizeMissionRate() {
   PopulateTiming()
 }
 
+function maximizeProjectRate() {
+  const result = GetMaxProjectRate()
+
+  for (let planet = 0; planet < GameDB.academy.planets; planet++) {
+    for (let farm = 0; farm < 3; farm++) {
+      for (let personnel = 0; personnel < 4; personnel++) {
+        let type = GameDB.academy.personnel[personnel]
+        portalPanel[`farm${planet}${farm}${type}`].value =
+          portalPanel.dataLinkage[`farm${planet}${farm}${type}`]
+      }
+    }
+  }
+
+  populateYield()
+  PopulateTiming()
+
+  return result
+}
+
+function updateProjectRateInfo() {
+  if (!portalPanel.projectRateInfo) return
+
+  const est = EstimateProjectCompletionTime()
+
+  if (est.status === 'no-goals') {
+    portalPanel.projectRateInfo.innerText =
+      'Projects: select goals on the Projects tab'
+  } else if (est.status === 'affordable') {
+    portalPanel.projectRateInfo.innerText =
+      'Projects: plan is affordable from stock'
+  } else if (est.status === 'never') {
+    portalPanel.projectRateInfo.innerText = `Projects ETA: never — no rate for ${
+      GameDB.academy.materials[est.bottleneck]
+    }`
+  } else {
+    portalPanel.projectRateInfo.innerText = `Projects ETA: ${formatDuration(
+      est.time,
+    )} — limited by ${GameDB.academy.materials[est.bottleneck]}`
+  }
+}
+
 function clearMissions() {
   for (let planet = 0; planet < GameDB.academy.planets; planet++) {
     for (let farm = 0; farm < 3; farm++) {
@@ -791,6 +850,8 @@ function populateYield() {
   } catch (e) {
     console.error(e)
   }
+
+  if (portalPanel.projectRateInfo) updateProjectRateInfo()
 }
 
 function genZeusRank(missionCount, duration) {
